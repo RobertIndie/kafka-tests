@@ -32,16 +32,16 @@ internal sealed class DisconnectTestApp
         for (var i = 0; i < _options.ProducerCount; i++)
         {
             var worker = new ProducerWorker(i, _options, _logger, _metrics);
-            tasks.Add(worker.RunAsync(cancellationToken));
+            tasks.Add(Task.Run(() => worker.RunAsync(cancellationToken), cancellationToken));
         }
 
         for (var i = 0; i < _options.ConsumerCount; i++)
         {
             var worker = new ConsumerWorker(i, _options, _logger, _metrics);
-            tasks.Add(worker.RunAsync(cancellationToken));
+            tasks.Add(Task.Run(() => worker.RunAsync(cancellationToken), cancellationToken));
         }
 
-        tasks.Add(ReportLoopAsync(cancellationToken));
+        tasks.Add(Task.Run(() => ReportLoopAsync(cancellationToken), cancellationToken));
 
         await Task.WhenAll(tasks);
     }
@@ -258,12 +258,13 @@ internal sealed class ProducerWorker
                 });
             });
 
+        var producer = builder.Build();
         _logger.Info(WorkerName, "create", "Created producer client.", new Dictionary<string, object?>
         {
             ["generation"] = generation,
             ["clientId"] = config.ClientId,
         });
-        return builder.Build();
+        return producer;
     }
 
     private void HandleLog(string level, string message, int generation) =>
@@ -492,13 +493,14 @@ internal sealed class ConsumerWorker
                 });
             });
 
+        var consumer = builder.Build();
         _logger.Info(WorkerName, "create", "Created consumer client.", new Dictionary<string, object?>
         {
             ["generation"] = generation,
             ["clientId"] = config.ClientId,
             ["groupId"] = config.GroupId,
         });
-        return builder.Build();
+        return consumer;
     }
 
     private void HandleLog(string level, string message, int generation) =>

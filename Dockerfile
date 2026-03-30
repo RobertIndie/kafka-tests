@@ -20,7 +20,6 @@ RUN set -eux; \
       -c Release \
       -r "${TARGETOS}-${rid_arch}" \
       --self-contained true \
-      -p:PublishSingleFile=true \
       -p:PublishTrimmed=false \
       -o /out
 
@@ -28,6 +27,6 @@ FROM mcr.microsoft.com/dotnet/runtime-deps:8.0-bookworm-slim AS runtime
 
 WORKDIR /app
 
-COPY --from=build /out/ksn-disconnect /app/ksn-disconnect
+COPY --from=build /out/ /app/
 
 ENTRYPOINT ["/app/ksn-disconnect"]
