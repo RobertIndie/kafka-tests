@@ -50,22 +50,23 @@ internal sealed class DisconnectTestApp
     {
         var interval = TimeSpan.FromSeconds(Math.Max(1, _options.StatsIntervalSec));
         using var timer = new PeriodicTimer(interval);
+        MetricsCollector.RunSummary? previousSnapshot = null;
+        DateTimeOffset? previousSnapshotAt = null;
         try
         {
             while (await timer.WaitForNextTickAsync(cancellationToken))
             {
+                var now = DateTimeOffset.UtcNow;
                 var snapshot = _metrics.Snapshot(_options);
-                _logger.Info("app", "summary", "Intermediate summary.", new Dictionary<string, object?>
-                {
-                    ["severity"] = snapshot.Severity,
-                    ["producedSucceeded"] = snapshot.ProducedSucceeded,
-                    ["producedFailed"] = snapshot.ProducedFailed,
-                    ["consumed"] = snapshot.Consumed,
-                    ["commitFailed"] = snapshot.CommitFailed,
-                    ["producerRecreated"] = snapshot.ProducerRecreated,
-                    ["consumerRecreated"] = snapshot.ConsumerRecreated,
-                    ["rebalances"] = snapshot.Rebalances,
-                });
+                var fields = SummaryFormatting.BuildIntermediateSummaryFields(
+                    _options,
+                    snapshot,
+                    previousSnapshot,
+                    now,
+                    previousSnapshotAt);
+                _logger.Info("app", "summary", "Intermediate summary.", fields);
+                previousSnapshot = snapshot;
+                previousSnapshotAt = now;
             }
         }
         catch (OperationCanceledException)
@@ -148,7 +149,7 @@ internal sealed class ProducerWorker
                 var elapsed = (now - lastTick).TotalSeconds;
                 lastTick = now;
                 var enabled = _options.ProducerTrafficEnabled(now);
-                var rate = enabled ? _options.GetCurrentRate(now) : 0d;
+                var rate = enabled ? _options.GetCurrentRatePerProducer(now) : 0d;
                 tokenBucket += elapsed * rate;
 
                 if (!enabled)
@@ -169,29 +170,7 @@ internal sealed class ProducerWorker
                 {
                     sequence++;
                     var payload = PayloadFactory.Create(_options, _workerId, sequence);
-                    _metrics.RecordProduceAttempt();
-                    try
-                    {
-                        var result = await producer.ProduceAsync(_options.Topic, payload, cancellationToken);
-                        _metrics.RecordProduceSuccess();
-                        _logger.Debug(WorkerName, "produce-ok", "Produced message.", new Dictionary<string, object?>
-                        {
-                            ["generation"] = generation,
-                            ["sequence"] = sequence,
-                            ["partition"] = result.Partition.Value,
-                            ["offset"] = result.Offset.Value,
-                        });
-                    }
-                    catch (ProduceException<string, string> ex)
-                    {
-                        _metrics.RecordProduceFailure();
-                        HandleKafkaError("produce-failed", ex.Error, ex.Message, generation);
-                    }
-                    catch (KafkaException ex)
-                    {
-                        _metrics.RecordProduceFailure();
-                        HandleKafkaError("produce-kafka-exception", ex.Error, ex.Message, generation);
-                    }
+                    await EnqueueMessageAsync(producer, payload, sequence, generation, cancellationToken);
                 }
             }
         }
@@ -221,6 +200,64 @@ internal sealed class ProducerWorker
         _options.UsesProducerRecycle &&
         _options.ProducerRecreateIntervalSec > 0 &&
         (DateTimeOffset.UtcNow - createdAt).TotalSeconds >= _options.ProducerRecreateIntervalSec;
+
+    private async Task EnqueueMessageAsync(
+        IProducer<string, string> producer,
+        Message<string, string> payload,
+        long sequence,
+        int generation,
+        CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            _metrics.RecordProduceAttempt();
+            try
+            {
+                producer.Produce(_options.Topic, payload, result =>
+                {
+                    if (result.Error.IsError)
+                    {
+                        _metrics.RecordProduceFailure();
+                        HandleKafkaError("produce-failed", result.Error, result.Error.Reason, generation);
+                        return;
+                    }
+
+                    _metrics.RecordProduceSuccess();
+                    _logger.Debug(WorkerName, "produce-ok", "Produced message.", new Dictionary<string, object?>
+                    {
+                        ["generation"] = generation,
+                        ["sequence"] = sequence,
+                        ["partition"] = result.Partition.Value,
+                        ["offset"] = result.Offset.Value,
+                    });
+                });
+                return;
+            }
+            catch (ProduceException<string, string> ex) when (ex.Error.Code == ErrorCode.Local_QueueFull)
+            {
+                _logger.Debug(WorkerName, "produce-queue-full", "Producer queue is full, backing off briefly.", new Dictionary<string, object?>
+                {
+                    ["generation"] = generation,
+                    ["code"] = ex.Error.Code,
+                    ["reason"] = ex.Error.Reason,
+                });
+                producer.Poll(TimeSpan.Zero);
+                await Task.Delay(10, cancellationToken);
+            }
+            catch (ProduceException<string, string> ex)
+            {
+                _metrics.RecordProduceFailure();
+                HandleKafkaError("produce-failed", ex.Error, ex.Message, generation);
+                return;
+            }
+            catch (KafkaException ex)
+            {
+                _metrics.RecordProduceFailure();
+                HandleKafkaError("produce-kafka-exception", ex.Error, ex.Message, generation);
+                return;
+            }
+        }
+    }
 
     private IProducer<string, string> BuildProducer(int generation)
     {

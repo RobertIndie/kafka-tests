@@ -102,6 +102,12 @@ internal sealed class AppOptions
         return withinCycle == 0 ? Math.Max(BurstRate, ProduceRate) : ProduceRate;
     }
 
+    public double GetCurrentRatePerProducer(DateTimeOffset now)
+    {
+        var producerCount = Math.Max(1, ProducerCount);
+        return GetCurrentRate(now) / producerCount;
+    }
+
     private DateTimeOffset? _processStartUtc;
     public DateTimeOffset? ProcessStartUtc
     {
